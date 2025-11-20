@@ -5,7 +5,7 @@ import {
   getAuth, 
   signInAnonymously, 
   onAuthStateChanged,
-  signInWithCustomToken // 保持，以防未来扩展
+  signInWithCustomToken 
 } from 'firebase/auth';
 import type { User as FirebaseUser } from 'firebase/auth';
 import { 
@@ -22,11 +22,10 @@ import {
   updateDoc,
   serverTimestamp,
   runTransaction,
-  orderBy, // <<< ADDED: 用于保证队列的 FIFO 顺序
+  // Removed 'orderBy' import to force client-side sorting/filtering
 } from 'firebase/firestore';
 
 // --- Global Variable Declarations (Mandatory for Canvas) ---
-// 声明环境全局变量，用于获取配置和认证信息
 declare const __app_id: string;
 declare const __firebase_config: string;
 declare const __initial_auth_token: string;
@@ -90,7 +89,6 @@ export default function App() {
   
   // --- Refs ---
   const localStreamRef = useRef<MediaStream | null>(null);
-  // 修复：初始化值应为 null，而不是引用自身
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const currentCallDocIdRef = useRef<string | null>(null); 
@@ -179,16 +177,28 @@ export default function App() {
 
       // 1. Check if anyone is waiting in the queue
       const queueRef = collection(db, 'artifacts', appId, 'public', 'data', 'voice_queue');
-      // Only find people who are NOT me, and order by creation time to enforce FIFO
-      const q = query(queueRef, where('userId', '!=', user.uid), orderBy('created'), limit(1)); // <<< MODIFIED: Added orderBy
-
+      // <<< MODIFIED: Removed complex query constraints to avoid Firebase index error
+      // Fetch up to 10 potential candidates (a small, safe limit)
+      const q = query(queueRef, limit(10));
+      
       // Use a transaction to atomicaly "grab" a waiting user
       await runTransaction(db, async (transaction) => {
         const querySnapshot = await getDocs(q);
         
-        if (!querySnapshot.empty) {
+        // --- Client-side filtering and sorting for FIFO ---
+        const availableDocs = querySnapshot.docs
+            .filter(doc => doc.data().userId !== user.uid) // Exclude current user
+            // Sort by 'created' timestamp (oldest first) to ensure FIFO
+            .sort((a, b) => {
+                // Firestore Timestamps need to be compared via toMillis()
+                const aTime = a.data().created?.toMillis() || 0;
+                const bTime = b.data().created?.toMillis() || 0;
+                return aTime - bTime;
+            });
+
+        if (availableDocs.length > 0) {
           // --- Found a match! (I am the Caller) ---
-          const targetDoc = querySnapshot.docs[0];
+          const targetDoc = availableDocs[0];
           const targetUserId = targetDoc.data().userId;
           
           // Delete them from queue so no one else grabs them
@@ -209,8 +219,6 @@ export default function App() {
             answer: null
           });
 
-          // Initialize WebRTC as Caller (outside transaction strictly speaking, but needed logic flow)
-          // We will trigger the actual createOffer in the logic below checking 'currentCallDocIdRef'
           return { role: 'caller', callId: callDocRef.id };
         } else {
           // --- No one waiting (I am the Waiter) ---
@@ -245,6 +253,7 @@ export default function App() {
   const listenForIncomingCalls = () => {
     if (!user) return;
     const callsRef = collection(db, 'artifacts', appId, 'public', 'data', 'voice_calls');
+    // This query is safe (simple equality filter)
     const q = query(callsRef, where('calleeId', '==', user.uid), limit(1));
 
     const unsubscribe = onSnapshot(q, async (snapshot) => {
@@ -297,7 +306,7 @@ export default function App() {
       }
     };
     
-    // <<< ADDED: WebRTC 连接状态监听，处理意外断开和失败
+    // WebRTC 连接状态监听，处理意外断开和失败
     pc.oniceconnectionstatechange = () => {
         // console.log(`ICE State: ${pc.iceConnectionState}`); 
         // 只有当连接状态变为失败或断开时，才尝试清理
