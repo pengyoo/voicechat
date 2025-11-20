@@ -24,7 +24,6 @@ import {
   runTransaction,
   Timestamp, // 引入 Timestamp
 } from 'firebase/firestore';
-// import type { DocumentData, QuerySnapshot } from 'firebase/firestore'; // <-- 修正: 将 QuerySnapshot 移到 type 导入
 
 // --- Global Variable Declarations (Mandatory for Canvas) ---
 declare const __app_id: string;
@@ -138,13 +137,21 @@ export default function App() {
       unsubscribeCallRef.current = null;
     }
 
-    // 4. Clean up Firestore
+    // 4. Clean up Firestore Queue entry
     if (queueDocIdRef.current) {
        // 清理自己排队的条目
        deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'voice_queue', queueDocIdRef.current)).catch(e => console.log("Failed to delete queue doc:", e));
        queueDocIdRef.current = null;
     }
     
+    // --- FIX: Clean up active Call Room document for explicit signal ---
+    if (currentCallDocIdRef.current) {
+       // 清理当前通话房间，这会立即触发对方的 onSnapshot，更快地通知对方挂断
+       const callDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'voice_calls', currentCallDocIdRef.current);
+       deleteDoc(callDocRef).catch(e => console.log("Failed to delete call doc:", e));
+    }
+    // ----------------------------------------------------
+
     setStatus('idle');
     setDebugMsg('');
     setCallDuration(0);
@@ -172,12 +179,28 @@ export default function App() {
       setUser(u);
     });
 
-    // Cleanup on unmount
+    // Cleanup on unmount (App component unloads)
     return () => {
       hangUp();
       unsubscribe();
     };
   }, [hangUp]);
+
+  // --- NEW: Handle Browser Close/Reload Cleanup ---
+  useEffect(() => {
+      const handleBeforeUnload = () => {
+          // 在浏览器关闭或刷新前，尝试异步执行清理操作。
+          // ⚠️ 注意：这个操作是尽力而为的，因为浏览器可能会在操作完成前关闭连接。
+          hangUp();
+      };
+
+      window.addEventListener('beforeunload', handleBeforeUnload);
+
+      return () => {
+          window.removeEventListener('beforeunload', handleBeforeUnload);
+      };
+  }, [hangUp]);
+
 
   // Timer for call duration
   useEffect(() => {
@@ -375,6 +398,16 @@ export default function App() {
           
           // Initialize WebRTC as Callee
           await initializePeerConnection(callId, 'callee');
+        }
+        
+        // FIX: Detect when the CALLER deletes the document (explicit hangup)
+        if (change.type === 'removed') {
+             console.log(`Call document ${change.doc.id} removed by partner. Hanging up.`);
+             setDebugMsg('伙伴已挂断，请尝试新的连接');
+             // 延迟执行 hangUp 以确保当前操作栈完成
+             setTimeout(() => {
+                hangUp();
+             }, 500);
         }
       });
     });
