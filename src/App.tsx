@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Mic, MicOff, Phone, SkipForward, User, Radio, Loader2, PhoneOff } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { 
@@ -14,7 +14,7 @@ import {
   doc, 
   onSnapshot, 
   deleteDoc, 
-  getDocs, 
+  getDocs, // <-- 引入 getDocs 用于外部查询
   query, 
   where, 
   limit, 
@@ -22,19 +22,20 @@ import {
   updateDoc,
   serverTimestamp,
   runTransaction,
-  // Removed 'orderBy' import to force client-side sorting/filtering
+  Timestamp, // 引入 Timestamp
 } from 'firebase/firestore';
+// import type { DocumentData, QuerySnapshot } from 'firebase/firestore'; // <-- 修正: 将 QuerySnapshot 移到 type 导入
 
 // --- Global Variable Declarations (Mandatory for Canvas) ---
 declare const __app_id: string;
 declare const __firebase_config: string;
 declare const __initial_auth_token: string;
 
+// --- Constants ---
+const HEARTBEAT_INTERVAL = 10000; // 10秒发送一次心跳
+const GHOST_CUTOFF_SECONDS = 15; // 超过15秒未活跃的用户视为幽灵用户
+
 // --- Firebase Configuration & Initialization ---
-
-// 硬编码配置作为可靠的回退。
-// NOTE: 请将这些占位符替换为您自己的 Firebase 项目凭证。
-
 const hardcodedConfig = {
   apiKey: "AIzaSyB4D35IX8vGMyeAcWTlZgyp5guHjJM0J_Y",
   authDomain: "audiochat-db1f4.firebaseapp.com",
@@ -46,26 +47,21 @@ const hardcodedConfig = {
 };
 
 const firebaseConfig: any = (() => {
-  // 1. 检查 Canvas 全局配置 (优先级最高)
   if (typeof __firebase_config !== 'undefined') {
     try {
       const config = JSON.parse(__firebase_config);
       if (config && config.projectId) {
-         return config; // 优先使用 Canvas 注入的配置
+         return config;
       }
     } catch (e) {
       console.error("Failed to parse __firebase_config. Using hardcoded fallback.", e);
     }
   }
-  
-  // 2. 使用硬编码作为最终回退 (已移除环境变量检查)
   return hardcodedConfig;
 })();
 
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
-
-// 优先使用 Canvas App ID，否则使用 Firebase 配置中的 projectId 或默认值
 const appId = typeof __app_id !== 'undefined' ? __app_id : firebaseConfig.projectId || 'default-app-id'; 
 
 // WebRTC Configuration (Public STUN servers)
@@ -95,16 +91,74 @@ export default function App() {
   const queueDocIdRef = useRef<string | null>(null);
   const unsubscribeCallRef = useRef<(() => void) | null>(null);
 
-  // --- Initialization ---
+  // --- Helper: Get User Media ---
+  const getLocalStream = async () => {
+    // 每次匹配都尝试获取新的流，以确保不重用已停止的轨道
+    if (localStreamRef.current) {
+        // 如果流存在，先停止旧流的轨道
+        localStreamRef.current.getTracks().forEach(track => track.stop());
+        localStreamRef.current = null;
+    }
+    
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      localStreamRef.current = stream;
+      // 保证新流的初始启用状态与 UI 匹配
+      stream.getAudioTracks().forEach(track => {
+         track.enabled = micEnabled;
+      });
+      return stream;
+    } catch (err) {
+      console.error("Error accessing microphone:", err);
+      setDebugMsg("无法访问麦克风，请检查权限");
+      throw err;
+    }
+  };
+
+  // --- Actions: Hang Up / Next ---
+  const hangUp = useCallback(async () => {
+    // 1. Stop WebRTC
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+    
+    // 2. STOP and clear Local Stream Tracks (CRITICAL FIX)
+    if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach(track => {
+            track.stop(); // 停止轨道
+        });
+        localStreamRef.current = null; // 清空引用，确保下次匹配时获取新流
+    }
+    setMicEnabled(true); // 重置麦克风启用状态
+
+    // 3. Unsubscribe Firestore listeners
+    if (unsubscribeCallRef.current) {
+      unsubscribeCallRef.current();
+      unsubscribeCallRef.current = null;
+    }
+
+    // 4. Clean up Firestore
+    if (queueDocIdRef.current) {
+       // 清理自己排队的条目
+       deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'voice_queue', queueDocIdRef.current)).catch(e => console.log("Failed to delete queue doc:", e));
+       queueDocIdRef.current = null;
+    }
+    
+    setStatus('idle');
+    setDebugMsg('');
+    setCallDuration(0);
+    currentCallDocIdRef.current = null;
+  }, [appId]); // Added appId to dependencies for safety
+
+  // --- Initialization & Cleanup ---
   useEffect(() => {
     const initAuth = async () => {
       const auth = getAuth(app);
       try {
         if (typeof __initial_auth_token !== 'undefined') {
-          // Use custom token if provided (Canvas environment)
           await signInWithCustomToken(auth, __initial_auth_token);
         } else {
-          // Fallback to anonymous sign-in
           await signInAnonymously(auth);
         }
       } catch (e) {
@@ -123,7 +177,7 @@ export default function App() {
       hangUp();
       unsubscribe();
     };
-  }, []);
+  }, [hangUp]);
 
   // Timer for call duration
   useEffect(() => {
@@ -137,21 +191,44 @@ export default function App() {
     }
     return () => clearInterval(interval);
   }, [status]);
+  
+  // --- Heartbeat Logic (Fix for Ghost Users) ---
+  useEffect(() => {
+      let heartbeatTimer: any;
 
-  // --- Helper: Get User Media ---
-  const getLocalStream = async () => {
-    if (localStreamRef.current) return localStreamRef.current;
-    try {
-      // 必须在 HTTPS 环境下才能获取麦克风权限
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      localStreamRef.current = stream;
-      return stream;
-    } catch (err) {
-      console.error("Error accessing microphone:", err);
-      setDebugMsg("无法访问麦克风，请检查权限");
-      throw err;
-    }
-  };
+      const sendHeartbeat = async () => {
+          const docId = queueDocIdRef.current;
+          if (docId && user) {
+              try {
+                  const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'voice_queue', docId);
+                  await updateDoc(docRef, {
+                      lastActive: serverTimestamp()
+                  });
+              } catch (e) {
+                  // If update fails, it likely means the doc was deleted (e.g., by another user who matched us)
+                  console.log("Heartbeat failed, potentially matched or deleted:", e);
+                  // Since the doc is gone, we can stop the heartbeat
+                  clearInterval(heartbeatTimer);
+                  // But only clear ref if we are no longer searching (this is a simple fail-safe)
+                  if (status !== 'searching') {
+                      queueDocIdRef.current = null;
+                  }
+              }
+          }
+      };
+
+      if (status === 'searching' && user && queueDocIdRef.current) {
+          // Send initial heartbeat immediately
+          sendHeartbeat();
+          // Set up recurring heartbeat
+          heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL);
+      } else if (heartbeatTimer) {
+          clearInterval(heartbeatTimer);
+      }
+
+      return () => clearInterval(heartbeatTimer);
+  }, [status, user, appId]);
+
 
   // --- Helper: Format Time ---
   const formatTime = (seconds: number) => {
@@ -167,30 +244,35 @@ export default function App() {
         return;
     }
     
-    // Reset state
+    // Reset state and clear old stream
     await hangUp(); 
+    
     setStatus('searching');
     setDebugMsg('正在寻找路人...');
 
     try {
-      await getLocalStream(); // Ensure we have mic ready
+      // Get a fresh stream every time
+      await getLocalStream(); 
 
-      // 1. Check if anyone is waiting in the queue
+      // 1. Define cutoff time for active users (Ghost Filtering)
+      const cutoffTime = Timestamp.fromMillis(Date.now() - GHOST_CUTOFF_SECONDS * 1000);
+
+      // 2. Query only users who have sent a recent heartbeat (Active users)
       const queueRef = collection(db, 'artifacts', appId, 'public', 'data', 'voice_queue');
-      // <<< MODIFIED: Removed complex query constraints to avoid Firebase index error
-      // Fetch up to 10 potential candidates (a small, safe limit)
-      const q = query(queueRef, limit(10));
+      // CRITICAL: We use a simple range query on 'lastActive' + limit, which should avoid composite index requirements.
+      const q = query(queueRef, where('lastActive', '>', cutoffTime), limit(15));
+      
+      // *** STEP 1: FETCH CANDIDATES OUTSIDE TRANSACTION (NON-ATOMIC READ) ***
+      const potentialCandidatesSnapshot = await getDocs(q);
       
       // Use a transaction to atomicaly "grab" a waiting user
       await runTransaction(db, async (transaction) => {
-        const querySnapshot = await getDocs(q);
         
         // --- Client-side filtering and sorting for FIFO ---
-        const availableDocs = querySnapshot.docs
+        const availableDocs = potentialCandidatesSnapshot.docs
             .filter(doc => doc.data().userId !== user.uid) // Exclude current user
             // Sort by 'created' timestamp (oldest first) to ensure FIFO
             .sort((a, b) => {
-                // Firestore Timestamps need to be compared via toMillis()
                 const aTime = a.data().created?.toMillis() || 0;
                 const bTime = b.data().created?.toMillis() || 0;
                 return aTime - bTime;
@@ -198,11 +280,25 @@ export default function App() {
 
         if (availableDocs.length > 0) {
           // --- Found a match! (I am the Caller) ---
-          const targetDoc = availableDocs[0];
-          const targetUserId = targetDoc.data().userId;
+          const targetDocRef = availableDocs[0].ref;
+          
+          // *** STEP 2: ATOMICALLY READ (INSIDE transaction) to check if it still exists ***
+          const currentTargetDoc = await transaction.get(targetDocRef);
+          
+          if (!currentTargetDoc.exists()) {
+              // Race condition lost: Another client deleted this document just before our transaction.
+              console.log("Lost race condition. Document already deleted.");
+              return { role: 'waiter' };
+          }
+          
+          const targetUserId = currentTargetDoc.data()?.userId;
+          if (!targetUserId) {
+               // Malformed data
+               return { role: 'waiter' };
+          }
           
           // Delete them from queue so no one else grabs them
-          transaction.delete(targetDoc.ref);
+          transaction.delete(targetDocRef);
           
           setDebugMsg('找到伙伴！正在连接...');
           
@@ -233,7 +329,8 @@ export default function App() {
           const queueRef = collection(db, 'artifacts', appId, 'public', 'data', 'voice_queue');
           const myQueueDoc = await addDoc(queueRef, {
             userId: user.uid,
-            created: serverTimestamp()
+            created: serverTimestamp(),
+            lastActive: serverTimestamp() // <-- Added initial heartbeat
           });
           queueDocIdRef.current = myQueueDoc.id;
           
@@ -259,10 +356,9 @@ export default function App() {
     const unsubscribe = onSnapshot(q, async (snapshot) => {
       snapshot.docChanges().forEach(async (change) => {
         if (change.type === 'added') {
-          // Someone called me!
           const callId = change.doc.id;
           
-          // Clean up my queue entry if it exists (optional, but good hygiene)
+          // Clean up my queue entry if it exists
           if (queueDocIdRef.current) {
              deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'voice_queue', queueDocIdRef.current)).catch(() => {});
              queueDocIdRef.current = null;
@@ -308,14 +404,10 @@ export default function App() {
     
     // WebRTC 连接状态监听，处理意外断开和失败
     pc.oniceconnectionstatechange = () => {
-        // console.log(`ICE State: ${pc.iceConnectionState}`); 
-        // 只有当连接状态变为失败或断开时，才尝试清理
         if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
-            // 只有当存在通话ID时才自动清理（避免清理用户主动挂断的情况）
             if (currentCallDocIdRef.current) { 
                 console.log(`WebRTC connection lost: ${pc.iceConnectionState}`);
                 setDebugMsg('连接已断开，请重试或换一个');
-                // 使用小延迟以允许 UI 状态更新
                 setTimeout(() => {
                     hangUp(); 
                 }, 500);
@@ -350,10 +442,10 @@ export default function App() {
           pc.setRemoteDescription(answerDescription);
         }
       });
-      unsubscribeCallRef.current = unsub; // Overwrite the previous queue listener if any
+      unsubscribeCallRef.current = unsub; 
 
     } else {
-      // Listen for Offer (It should be there or coming very soon)
+      // Listen for Offer 
       const unsub = onSnapshot(callDocRef, async (snapshot) => {
          const data = snapshot.data();
          if (!pc.currentRemoteDescription && data?.offer) {
@@ -379,39 +471,8 @@ export default function App() {
     });
   };
 
-  // --- Actions: Hang Up / Next ---
-  const hangUp = async () => {
-    // 1. Stop WebRTC
-    if (peerConnectionRef.current) {
-      peerConnectionRef.current.close();
-      peerConnectionRef.current = null;
-    }
-    
-    // 2. Stop Local Stream (optional: keep it if we want fast switching, but cleaner to stop)
-    // Keeping it alive for faster "Next" switching, only stop on component unmount
-    
-    // 3. Unsubscribe Firestore listeners
-    if (unsubscribeCallRef.current) {
-      unsubscribeCallRef.current();
-      unsubscribeCallRef.current = null;
-    }
-
-    // 4. Clean up Firestore
-    if (queueDocIdRef.current) {
-       // 清理自己排队的条目
-       deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'voice_queue', queueDocIdRef.current)).catch(e => console.log(e));
-       queueDocIdRef.current = null;
-    }
-    // We don't strictly delete the Call doc immediately to avoid race conditions on the other user's end reading it,
-    // but in a production app we would have a cleanup trigger or TTL.
-    
-    setStatus('idle');
-    setDebugMsg('');
-    setCallDuration(0);
-    currentCallDocIdRef.current = null;
-  };
-
   const handleNext = async () => {
+    // 确保 hangUp 完成清理，尤其是媒体流停止
     await hangUp();
     setTimeout(() => {
         startMatching();
@@ -419,12 +480,13 @@ export default function App() {
   };
 
   const toggleMic = () => {
+    const newMicState = !micEnabled;
     if (localStreamRef.current) {
       localStreamRef.current.getAudioTracks().forEach(track => {
-        track.enabled = !micEnabled;
+        track.enabled = newMicState;
       });
-      setMicEnabled(!micEnabled);
     }
+    setMicEnabled(newMicState);
   };
 
   // --- UI Render ---
