@@ -5,7 +5,6 @@ import {
   getAuth, 
   signInAnonymously, 
   onAuthStateChanged,
-  signInWithCustomToken // 保持，以防未来扩展
 } from 'firebase/auth';
 import type { User as FirebaseUser } from 'firebase/auth';
 import { 
