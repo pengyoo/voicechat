@@ -30,30 +30,19 @@ declare const __app_id: string;
 declare const __firebase_config: string;
 declare const __initial_auth_token: string;
 
-// 声明 process 变量，用于兼容不支持 import.meta.env 的旧编译目标（如 es2015）
-declare const process: {
-  env: {
-    VITE_FIREBASE_API_KEY: string;
-    VITE_FIREBASE_AUTH_DOMAIN: string;
-    VITE_FIREBASE_PROJECT_ID: string;
-    VITE_FIREBASE_STORAGE_BUCKET: string;
-    VITE_FIREBASE_MESSAGING_SENDER_ID: string;
-    VITE_FIREBASE_APP_ID: string;
-  };
-};
+// --- Firebase Configuration & Initialization ---
 
-// --- Firebase Configuration & Initialization (Using Canvas Globals or Vercel Env) ---
-const getEnvConfig = () => {
-    // 尝试使用 process.env 访问环境变量，以兼容不支持 import.meta.env 的编译环境
-    // 注意: 在标准 Vite/Browser环境中，这通常是 import.meta.env
-    return {
-        apiKey: process.env.VITE_FIREBASE_API_KEY,
-        authDomain: process.env.VITE_FIREBASE_AUTH_DOMAIN,
-        projectId: process.env.VITE_FIREBASE_PROJECT_ID,
-        storageBucket: process.env.VITE_FIREBASE_STORAGE_BUCKET,
-        messagingSenderId: process.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
-        appId: process.env.VITE_FIREBASE_APP_ID,
-    };
+// 硬编码配置作为可靠的回退。
+// NOTE: 请将这些占位符替换为您自己的 Firebase 项目凭证。
+
+const hardcodedConfig = {
+  apiKey: "AIzaSyB4D35IX8vGMyeAcWTlZgyp5guHjJM0J_Y",
+  authDomain: "audiochat-db1f4.firebaseapp.com",
+  projectId: "audiochat-db1f4",
+  storageBucket: "audiochat-db1f4.firebasestorage.app",
+  messagingSenderId: "437257644304",
+  appId: "1:437257644304:web:90adf746bc27d9e5831d95",
+  measurementId: "G-1E27PDDW52"
 };
 
 const firebaseConfig: any = (() => {
@@ -62,24 +51,15 @@ const firebaseConfig: any = (() => {
     try {
       const config = JSON.parse(__firebase_config);
       if (config && config.projectId) {
-         console.log("Using Canvas environment configuration.");
-         return config;
+         return config; // 优先使用 Canvas 注入的配置
       }
     } catch (e) {
-      console.error("Failed to parse __firebase_config:", e);
+      console.error("Failed to parse __firebase_config. Using hardcoded fallback.", e);
     }
   }
   
-  // 2. 检查 Vercel / Vite 环境变量 (作为 fallback)
-  const envConfig = getEnvConfig();
-  if (envConfig.apiKey && envConfig.projectId) {
-      console.log("Using Vercel/Vite environment variables configuration.");
-      return envConfig;
-  }
-  
-  // 3. 既没有 Canvas 全局变量，也没有 Vercel 环境变量
-  console.error("Firebase configuration is missing in both environments.");
-  return {};
+  // 2. 使用硬编码作为最终回退 (已移除环境变量检查)
+  return hardcodedConfig;
 })();
 
 const app = initializeApp(firebaseConfig);
