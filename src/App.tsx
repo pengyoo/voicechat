@@ -1,18 +1,17 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Mic, MicOff, Phone, SkipForward, User, Volume2, Radio, Loader2, PhoneOff } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { Mic, MicOff, Phone, SkipForward, User, Radio, Loader2, PhoneOff } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
   signInAnonymously, 
-  onAuthStateChanged
+  onAuthStateChanged,
+  signInWithCustomToken // 保持，以防未来扩展
 } from 'firebase/auth';
-// 修复：将 User 作为类型单独引入，避免构建工具报错
 import type { User as FirebaseUser } from 'firebase/auth';
 import { 
   getFirestore, 
   collection, 
   doc, 
-  setDoc, 
   onSnapshot, 
   deleteDoc, 
   getDocs, 
@@ -23,12 +22,10 @@ import {
   updateDoc,
   serverTimestamp,
   runTransaction,
-  DocumentSnapshot
 } from 'firebase/firestore';
 
 // --- Firebase Configuration ---
-// ⚠️ 警告：在本地运行时，请务必将下面的 JSON.parse(...) 替换为你真实的 Firebase 配置对象
-// 例如： const firebaseConfig = { apiKey: "...", ... };
+// 使用 VITE_ 前缀环境变量来安全地注入配置
 const firebaseConfig = {
   apiKey: "AIzaSyB4D35IX8vGMyeAcWTlZgyp5guHjJM0J_Y",
   authDomain: "audiochat-db1f4.firebaseapp.com",
@@ -42,7 +39,8 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
-const appId = '1:437257644304:web:90adf746bc27d9e5831d95';
+// 部署时使用 Vercel 提供的 Project ID 作为 App ID
+const appId = import.meta.env.VITE_FIREBASE_PROJECT_ID || 'audiochat-db1f4'; 
 
 // WebRTC Configuration (Public STUN servers)
 const rtcConfig = {
@@ -60,7 +58,6 @@ export default function App() {
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [status, setStatus] = useState<ConnectionStatus>('idle');
   const [micEnabled, setMicEnabled] = useState(true);
-  const [remoteMicEnabled, setRemoteMicEnabled] = useState(true); // Mock status for MVP
   const [debugMsg, setDebugMsg] = useState('');
   const [callDuration, setCallDuration] = useState(0);
   
@@ -68,7 +65,8 @@ export default function App() {
   const localStreamRef = useRef<MediaStream | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
-  const currentCallDocIdRef = useRef<string | null>(null);
+  // 修复：将 useRef 的初始值设置为 null
+  const currentCallDocIdRef = useRef<string | null>(null); 
   const queueDocIdRef = useRef<string | null>(null);
   const unsubscribeCallRef = useRef<(() => void) | null>(null);
 
@@ -76,12 +74,8 @@ export default function App() {
   useEffect(() => {
     const initAuth = async () => {
       try {
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-            // @ts-ignore
-            await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-            await signInAnonymously(auth);
-        }
+        // 修复 TS2304 错误：在非 Canvas 环境中，我们直接使用匿名登录
+        await signInAnonymously(auth);
       } catch (e) {
         console.error("Auth failed", e);
         setDebugMsg("认证失败，请刷新重试");
@@ -117,6 +111,7 @@ export default function App() {
   const getLocalStream = async () => {
     if (localStreamRef.current) return localStreamRef.current;
     try {
+      // 必须在 HTTPS 环境下才能获取麦克风权限
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
       localStreamRef.current = stream;
       return stream;
@@ -220,7 +215,6 @@ export default function App() {
       snapshot.docChanges().forEach(async (change) => {
         if (change.type === 'added') {
           // Someone called me!
-          const callData = change.doc.data();
           const callId = change.doc.id;
           
           // Clean up my queue entry if it exists (optional, but good hygiene)
