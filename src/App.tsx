@@ -5,6 +5,7 @@ import {
   getAuth, 
   signInAnonymously, 
   onAuthStateChanged,
+  signInWithCustomToken // 保持，以防未来扩展
 } from 'firebase/auth';
 import type { User as FirebaseUser } from 'firebase/auth';
 import { 
@@ -23,23 +24,69 @@ import {
   runTransaction,
 } from 'firebase/firestore';
 
-// --- Firebase Configuration ---
-// 使用 VITE_ 前缀环境变量来安全地注入配置
-const firebaseConfig = {
-  apiKey: "AIzaSyB4D35IX8vGMyeAcWTlZgyp5guHjJM0J_Y",
-  authDomain: "audiochat-db1f4.firebaseapp.com",
-  projectId: "audiochat-db1f4",
-  storageBucket: "audiochat-db1f4.firebasestorage.app",
-  messagingSenderId: "437257644304",
-  appId: "1:437257644304:web:90adf746bc27d9e5831d95",
-  measurementId: "G-1E27PDDW52"
+// --- Global Variable Declarations (Mandatory for Canvas) ---
+// 声明环境全局变量，用于获取配置和认证信息
+declare const __app_id: string;
+declare const __firebase_config: string;
+declare const __initial_auth_token: string;
+
+// 声明 process 变量，用于兼容不支持 import.meta.env 的旧编译目标（如 es2015）
+declare const process: {
+  env: {
+    VITE_FIREBASE_API_KEY: string;
+    VITE_FIREBASE_AUTH_DOMAIN: string;
+    VITE_FIREBASE_PROJECT_ID: string;
+    VITE_FIREBASE_STORAGE_BUCKET: string;
+    VITE_FIREBASE_MESSAGING_SENDER_ID: string;
+    VITE_FIREBASE_APP_ID: string;
+  };
 };
 
+// --- Firebase Configuration & Initialization (Using Canvas Globals or Vercel Env) ---
+const getEnvConfig = () => {
+    // 尝试使用 process.env 访问环境变量，以兼容不支持 import.meta.env 的编译环境
+    // 注意: 在标准 Vite/Browser环境中，这通常是 import.meta.env
+    return {
+        apiKey: process.env.VITE_FIREBASE_API_KEY,
+        authDomain: process.env.VITE_FIREBASE_AUTH_DOMAIN,
+        projectId: process.env.VITE_FIREBASE_PROJECT_ID,
+        storageBucket: process.env.VITE_FIREBASE_STORAGE_BUCKET,
+        messagingSenderId: process.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+        appId: process.env.VITE_FIREBASE_APP_ID,
+    };
+};
+
+const firebaseConfig: any = (() => {
+  // 1. 检查 Canvas 全局配置 (优先级最高)
+  if (typeof __firebase_config !== 'undefined') {
+    try {
+      const config = JSON.parse(__firebase_config);
+      if (config && config.projectId) {
+         console.log("Using Canvas environment configuration.");
+         return config;
+      }
+    } catch (e) {
+      console.error("Failed to parse __firebase_config:", e);
+    }
+  }
+  
+  // 2. 检查 Vercel / Vite 环境变量 (作为 fallback)
+  const envConfig = getEnvConfig();
+  if (envConfig.apiKey && envConfig.projectId) {
+      console.log("Using Vercel/Vite environment variables configuration.");
+      return envConfig;
+  }
+  
+  // 3. 既没有 Canvas 全局变量，也没有 Vercel 环境变量
+  console.error("Firebase configuration is missing in both environments.");
+  return {};
+})();
+
 const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
 const db = getFirestore(app);
-// 部署时使用 Vercel 提供的 Project ID 作为 App ID
-const appId = import.meta.env.VITE_FIREBASE_PROJECT_ID || 'audiochat-db1f4'; 
+
+// 优先使用 Canvas App ID，否则使用 Firebase 配置中的 projectId 或默认值
+const appId = typeof __app_id !== 'undefined' ? __app_id : firebaseConfig.projectId || 'default-app-id'; 
 
 // WebRTC Configuration (Public STUN servers)
 const rtcConfig = {
@@ -62,9 +109,9 @@ export default function App() {
   
   // --- Refs ---
   const localStreamRef = useRef<MediaStream | null>(null);
+  // 修复：初始化值应为 null，而不是引用自身
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
-  // 修复：将 useRef 的初始值设置为 null
   const currentCallDocIdRef = useRef<string | null>(null); 
   const queueDocIdRef = useRef<string | null>(null);
   const unsubscribeCallRef = useRef<(() => void) | null>(null);
@@ -72,9 +119,15 @@ export default function App() {
   // --- Initialization ---
   useEffect(() => {
     const initAuth = async () => {
+      const auth = getAuth(app);
       try {
-        // 修复 TS2304 错误：在非 Canvas 环境中，我们直接使用匿名登录
-        await signInAnonymously(auth);
+        if (typeof __initial_auth_token !== 'undefined') {
+          // Use custom token if provided (Canvas environment)
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          // Fallback to anonymous sign-in
+          await signInAnonymously(auth);
+        }
       } catch (e) {
         console.error("Auth failed", e);
         setDebugMsg("认证失败，请刷新重试");
@@ -82,7 +135,7 @@ export default function App() {
     };
     initAuth();
 
-    const unsubscribe = onAuthStateChanged(auth, (u) => {
+    const unsubscribe = onAuthStateChanged(getAuth(app), (u) => {
       setUser(u);
     });
 
@@ -130,7 +183,10 @@ export default function App() {
 
   // --- Core Logic: Search & Match ---
   const startMatching = async () => {
-    if (!user) return;
+    if (!user) {
+        setDebugMsg('认证中，请稍候...');
+        return;
+    }
     
     // Reset state
     await hangUp(); 
@@ -227,7 +283,9 @@ export default function App() {
           setStatus('connecting');
           
           // Unsubscribe from listening to new calls
-          unsubscribe();
+          if (unsubscribeCallRef.current) {
+             unsubscribeCallRef.current();
+          }
           
           // Initialize WebRTC as Callee
           await initializePeerConnection(callId, 'callee');
@@ -374,7 +432,7 @@ export default function App() {
         </div>
         <div className="flex items-center gap-2 text-xs text-gray-400 bg-gray-800 px-3 py-1 rounded-full">
           <User className="w-3 h-3" />
-          {status === 'connected' ? '对方在线' : '等待中...'}
+          {user ? user.uid : '认证中...'}
         </div>
       </header>
 
@@ -464,7 +522,8 @@ export default function App() {
           {status === 'idle' ? (
             <button 
               onClick={startMatching}
-              className="flex-1 bg-white text-black font-bold py-4 px-8 rounded-full shadow-lg shadow-white/10 hover:scale-105 active:scale-95 transition-all flex items-center justify-center gap-2"
+              disabled={!user} // Disable if user is null (still authenticating)
+              className={`flex-1 font-bold py-4 px-8 rounded-full shadow-lg shadow-white/10 transition-all flex items-center justify-center gap-2 ${!user ? 'bg-gray-700 text-gray-400 cursor-not-allowed' : 'bg-white text-black hover:scale-105 active:scale-95'}`}
             >
               <Phone className="w-5 h-5" />
               <span>开始匹配</span>
