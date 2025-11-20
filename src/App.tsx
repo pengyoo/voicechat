@@ -532,11 +532,11 @@ export default function App() {
       <header className="w-full p-4 flex justify-between items-center bg-gray-800/50 backdrop-blur-md border-b border-gray-700 absolute top-0 z-10">
         <div className="flex items-center gap-2">
           <Radio className={`w-5 h-5 ${status === 'connected' ? 'text-green-400 animate-pulse' : 'text-gray-400'}`} />
-          <h1 className="text-lg font-bold tracking-wide">AnonymousVoice</h1>
+          <h1 className="text-lg font-bold tracking-wide">陌声</h1>
         </div>
         <div className="flex items-center gap-2 text-xs text-gray-400 bg-gray-800 px-3 py-1 rounded-full">
           <User className="w-3 h-3" />
-          {user ? user.uid : '认证中...'}
+          {user ? `ID: ...${user.uid.slice(-4)}` : '认证中...'}
         </div>
       </header>
 
