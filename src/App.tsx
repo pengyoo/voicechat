@@ -22,6 +22,7 @@ import {
   updateDoc,
   serverTimestamp,
   runTransaction,
+  orderBy, // <<< ADDED: 用于保证队列的 FIFO 顺序
 } from 'firebase/firestore';
 
 // --- Global Variable Declarations (Mandatory for Canvas) ---
@@ -178,9 +179,9 @@ export default function App() {
 
       // 1. Check if anyone is waiting in the queue
       const queueRef = collection(db, 'artifacts', appId, 'public', 'data', 'voice_queue');
-      // Only find people who are NOT me
-      const q = query(queueRef, where('userId', '!=', user.uid), limit(1));
-      
+      // Only find people who are NOT me, and order by creation time to enforce FIFO
+      const q = query(queueRef, where('userId', '!=', user.uid), orderBy('created'), limit(1)); // <<< MODIFIED: Added orderBy
+
       // Use a transaction to atomicaly "grab" a waiting user
       await runTransaction(db, async (transaction) => {
         const querySnapshot = await getDocs(q);
@@ -295,6 +296,24 @@ export default function App() {
         setDebugMsg('');
       }
     };
+    
+    // <<< ADDED: WebRTC 连接状态监听，处理意外断开和失败
+    pc.oniceconnectionstatechange = () => {
+        // console.log(`ICE State: ${pc.iceConnectionState}`); 
+        // 只有当连接状态变为失败或断开时，才尝试清理
+        if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+            // 只有当存在通话ID时才自动清理（避免清理用户主动挂断的情况）
+            if (currentCallDocIdRef.current) { 
+                console.log(`WebRTC connection lost: ${pc.iceConnectionState}`);
+                setDebugMsg('连接已断开，请重试或换一个');
+                // 使用小延迟以允许 UI 状态更新
+                setTimeout(() => {
+                    hangUp(); 
+                }, 500);
+            }
+        }
+    };
+    // ----------------------------------------------------
 
     // ICE Candidates Logic
     const callDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'voice_calls', callId);
@@ -370,6 +389,7 @@ export default function App() {
 
     // 4. Clean up Firestore
     if (queueDocIdRef.current) {
+       // 清理自己排队的条目
        deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'voice_queue', queueDocIdRef.current)).catch(e => console.log(e));
        queueDocIdRef.current = null;
     }
