@@ -14,7 +14,7 @@ import {
   doc, 
   onSnapshot, 
   deleteDoc, 
-  getDocs, // <-- 引入 getDocs 用于外部查询
+  getDocs, 
   query, 
   where, 
   limit, 
@@ -22,19 +22,19 @@ import {
   updateDoc,
   serverTimestamp,
   runTransaction,
-  Timestamp, // 引入 Timestamp
+  Timestamp, 
 } from 'firebase/firestore';
 
-// --- Global Variable Declarations (Mandatory for Canvas) ---
+// --- Global Variable Declarations ---
 declare const __app_id: string;
 declare const __firebase_config: string;
 declare const __initial_auth_token: string;
 
 // --- Constants ---
-const HEARTBEAT_INTERVAL = 10000; // 10秒发送一次心跳
-const GHOST_CUTOFF_SECONDS = 15; // 超过15秒未活跃的用户视为幽灵用户
+const HEARTBEAT_INTERVAL = 10000; 
+const GHOST_CUTOFF_SECONDS = 15; 
 
-// --- Firebase Configuration & Initialization ---
+// --- Firebase Configuration ---
 const hardcodedConfig = {
   apiKey: "AIzaSyB4D35IX8vGMyeAcWTlZgyp5guHjJM0J_Y",
   authDomain: "audiochat-db1f4.firebaseapp.com",
@@ -63,7 +63,7 @@ const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 const appId = typeof __app_id !== 'undefined' ? __app_id : firebaseConfig.projectId || 'default-app-id'; 
 
-// WebRTC Configuration (Public STUN servers)
+// WebRTC Configuration
 const rtcConfig = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -71,7 +71,6 @@ const rtcConfig = {
   ]
 };
 
-// --- Types & Constants ---
 type ConnectionStatus = 'idle' | 'searching' | 'connecting' | 'connected' | 'error';
 
 export default function App() {
@@ -92,9 +91,7 @@ export default function App() {
 
   // --- Helper: Get User Media ---
   const getLocalStream = async () => {
-    // 每次匹配都尝试获取新的流，以确保不重用已停止的轨道
     if (localStreamRef.current) {
-        // 如果流存在，先停止旧流的轨道
         localStreamRef.current.getTracks().forEach(track => track.stop());
         localStreamRef.current = null;
     }
@@ -102,7 +99,6 @@ export default function App() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
       localStreamRef.current = stream;
-      // 保证新流的初始启用状态与 UI 匹配
       stream.getAudioTracks().forEach(track => {
          track.enabled = micEnabled;
       });
@@ -122,14 +118,12 @@ export default function App() {
       peerConnectionRef.current = null;
     }
     
-    // 2. STOP and clear Local Stream Tracks (CRITICAL FIX)
+    // 2. Stop Local Stream
     if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach(track => {
-            track.stop(); // 停止轨道
-        });
-        localStreamRef.current = null; // 清空引用，确保下次匹配时获取新流
+        localStreamRef.current.getTracks().forEach(track => track.stop());
+        localStreamRef.current = null;
     }
-    setMicEnabled(true); // 重置麦克风启用状态
+    setMicEnabled(true); 
 
     // 3. Unsubscribe Firestore listeners
     if (unsubscribeCallRef.current) {
@@ -137,26 +131,24 @@ export default function App() {
       unsubscribeCallRef.current = null;
     }
 
-    // 4. Clean up Firestore Queue entry
+    // 4. Clean up Queue
     if (queueDocIdRef.current) {
-       // 清理自己排队的条目
        deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'voice_queue', queueDocIdRef.current)).catch(e => console.log("Failed to delete queue doc:", e));
        queueDocIdRef.current = null;
     }
     
-    // --- FIX: Clean up active Call Room document for explicit signal ---
+    // 5. Clean up Call Room (Signal to other user)
     if (currentCallDocIdRef.current) {
-       // 清理当前通话房间，这会立即触发对方的 onSnapshot，更快地通知对方挂断
        const callDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'voice_calls', currentCallDocIdRef.current);
-       deleteDoc(callDocRef).catch(e => console.log("Failed to delete call doc:", e));
+       // 尝试删除文档。如果文档已经被对方删除，这里可能会报错或无操作，所以 catch 住即可
+       deleteDoc(callDocRef).catch(e => console.log("Call doc potentially already deleted:", e));
+       currentCallDocIdRef.current = null;
     }
-    // ----------------------------------------------------
 
     setStatus('idle');
     setDebugMsg('');
     setCallDuration(0);
-    currentCallDocIdRef.current = null;
-  }, [appId]); // Added appId to dependencies for safety
+  }, [appId]);
 
   // --- Initialization & Cleanup ---
   useEffect(() => {
@@ -179,30 +171,21 @@ export default function App() {
       setUser(u);
     });
 
-    // Cleanup on unmount (App component unloads)
     return () => {
       hangUp();
       unsubscribe();
     };
   }, [hangUp]);
 
-  // --- NEW: Handle Browser Close/Reload Cleanup ---
   useEffect(() => {
       const handleBeforeUnload = () => {
-          // 在浏览器关闭或刷新前，尝试异步执行清理操作。
-          // ⚠️ 注意：这个操作是尽力而为的，因为浏览器可能会在操作完成前关闭连接。
           hangUp();
       };
-
       window.addEventListener('beforeunload', handleBeforeUnload);
-
-      return () => {
-          window.removeEventListener('beforeunload', handleBeforeUnload);
-      };
+      return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, [hangUp]);
 
-
-  // Timer for call duration
+  // Timer
   useEffect(() => {
     let interval: any;
     if (status === 'connected') {
@@ -215,86 +198,58 @@ export default function App() {
     return () => clearInterval(interval);
   }, [status]);
   
-  // --- Heartbeat Logic (Fix for Ghost Users) ---
+  // Heartbeat
   useEffect(() => {
       let heartbeatTimer: any;
-
       const sendHeartbeat = async () => {
           const docId = queueDocIdRef.current;
           if (docId && user) {
               try {
                   const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'voice_queue', docId);
-                  await updateDoc(docRef, {
-                      lastActive: serverTimestamp()
-                  });
+                  await updateDoc(docRef, { lastActive: serverTimestamp() });
               } catch (e) {
-                  // If update fails, it likely means the doc was deleted (e.g., by another user who matched us)
-                  console.log("Heartbeat failed, potentially matched or deleted:", e);
-                  // Since the doc is gone, we can stop the heartbeat
                   clearInterval(heartbeatTimer);
-                  // But only clear ref if we are no longer searching (this is a simple fail-safe)
                   if (status !== 'searching') {
                       queueDocIdRef.current = null;
                   }
               }
           }
       };
-
       if (status === 'searching' && user && queueDocIdRef.current) {
-          // Send initial heartbeat immediately
           sendHeartbeat();
-          // Set up recurring heartbeat
           heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL);
       } else if (heartbeatTimer) {
           clearInterval(heartbeatTimer);
       }
-
       return () => clearInterval(heartbeatTimer);
   }, [status, user, appId]);
 
-
-  // --- Helper: Format Time ---
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
-  // --- Core Logic: Search & Match ---
+  // --- Match Logic ---
   const startMatching = async () => {
     if (!user) {
         setDebugMsg('认证中，请稍候...');
         return;
     }
-    
-    // Reset state and clear old stream
     await hangUp(); 
-    
     setStatus('searching');
     setDebugMsg('正在寻找路人...');
 
     try {
-      // Get a fresh stream every time
       await getLocalStream(); 
-
-      // 1. Define cutoff time for active users (Ghost Filtering)
       const cutoffTime = Timestamp.fromMillis(Date.now() - GHOST_CUTOFF_SECONDS * 1000);
-
-      // 2. Query only users who have sent a recent heartbeat (Active users)
       const queueRef = collection(db, 'artifacts', appId, 'public', 'data', 'voice_queue');
-      // CRITICAL: We use a simple range query on 'lastActive' + limit, which should avoid composite index requirements.
       const q = query(queueRef, where('lastActive', '>', cutoffTime), limit(15));
-      
-      // *** STEP 1: FETCH CANDIDATES OUTSIDE TRANSACTION (NON-ATOMIC READ) ***
       const potentialCandidatesSnapshot = await getDocs(q);
       
-      // Use a transaction to atomicaly "grab" a waiting user
       await runTransaction(db, async (transaction) => {
-        
-        // --- Client-side filtering and sorting for FIFO ---
         const availableDocs = potentialCandidatesSnapshot.docs
-            .filter(doc => doc.data().userId !== user.uid) // Exclude current user
-            // Sort by 'created' timestamp (oldest first) to ensure FIFO
+            .filter(doc => doc.data().userId !== user.uid)
             .sort((a, b) => {
                 const aTime = a.data().created?.toMillis() || 0;
                 const bTime = b.data().created?.toMillis() || 0;
@@ -302,34 +257,19 @@ export default function App() {
             });
 
         if (availableDocs.length > 0) {
-          // --- Found a match! (I am the Caller) ---
           const targetDocRef = availableDocs[0].ref;
-          
-          // *** STEP 2: ATOMICALLY READ (INSIDE transaction) to check if it still exists ***
           const currentTargetDoc = await transaction.get(targetDocRef);
           
-          if (!currentTargetDoc.exists()) {
-              // Race condition lost: Another client deleted this document just before our transaction.
-              console.log("Lost race condition. Document already deleted.");
-              return { role: 'waiter' };
-          }
-          
+          if (!currentTargetDoc.exists()) return { role: 'waiter' };
           const targetUserId = currentTargetDoc.data()?.userId;
-          if (!targetUserId) {
-               // Malformed data
-               return { role: 'waiter' };
-          }
+          if (!targetUserId) return { role: 'waiter' };
           
-          // Delete them from queue so no one else grabs them
           transaction.delete(targetDocRef);
-          
           setDebugMsg('找到伙伴！正在连接...');
           
-          // Create a Call Room
           const callDocRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'voice_calls'));
           currentCallDocIdRef.current = callDocRef.id;
 
-          // Set up initial call data
           transaction.set(callDocRef, {
             callerId: user.uid,
             calleeId: targetUserId,
@@ -340,7 +280,6 @@ export default function App() {
 
           return { role: 'caller', callId: callDocRef.id };
         } else {
-          // --- No one waiting (I am the Waiter) ---
           return { role: 'waiter' };
         }
       }).then(async (result: any) => {
@@ -348,20 +287,16 @@ export default function App() {
           setStatus('connecting');
           await initializePeerConnection(result.callId, 'caller');
         } else {
-          // Add myself to queue
           const queueRef = collection(db, 'artifacts', appId, 'public', 'data', 'voice_queue');
           const myQueueDoc = await addDoc(queueRef, {
             userId: user.uid,
             created: serverTimestamp(),
-            lastActive: serverTimestamp() // <-- Added initial heartbeat
+            lastActive: serverTimestamp()
           });
           queueDocIdRef.current = myQueueDoc.id;
-          
-          // Listen for someone to pick me up
           listenForIncomingCalls();
         }
       });
-
     } catch (err) {
       console.error(err);
       setDebugMsg("匹配出错，请重试");
@@ -369,64 +304,44 @@ export default function App() {
     }
   };
 
-  // --- Logic: Listen for Incoming Calls (Waiter Side) ---
   const listenForIncomingCalls = () => {
     if (!user) return;
     const callsRef = collection(db, 'artifacts', appId, 'public', 'data', 'voice_calls');
-    // This query is safe (simple equality filter)
     const q = query(callsRef, where('calleeId', '==', user.uid), limit(1));
 
     const unsubscribe = onSnapshot(q, async (snapshot) => {
       snapshot.docChanges().forEach(async (change) => {
         if (change.type === 'added') {
           const callId = change.doc.id;
-          
-          // Clean up my queue entry if it exists
           if (queueDocIdRef.current) {
              deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'voice_queue', queueDocIdRef.current)).catch(() => {});
              queueDocIdRef.current = null;
           }
-
           setDebugMsg('连接中...');
           currentCallDocIdRef.current = callId;
           setStatus('connecting');
           
-          // Unsubscribe from listening to new calls
-          if (unsubscribeCallRef.current) {
-             unsubscribeCallRef.current();
-          }
-          
-          // Initialize WebRTC as Callee
+          if (unsubscribeCallRef.current) unsubscribeCallRef.current();
           await initializePeerConnection(callId, 'callee');
         }
-        
-        // FIX: Detect when the CALLER deletes the document (explicit hangup)
+        // Callee-side collection listener for removal (Backup mechanism)
         if (change.type === 'removed') {
-             console.log(`Call document ${change.doc.id} removed by partner. Hanging up.`);
-             setDebugMsg('伙伴已挂断，请尝试新的连接');
-             // 延迟执行 hangUp 以确保当前操作栈完成
-             setTimeout(() => {
-                hangUp();
-             }, 500);
+             console.log(`Call document ${change.doc.id} removed (detected via Query).`);
+             setDebugMsg('对方已离开');
+             setTimeout(() => hangUp(), 300);
         }
       });
     });
-    
     unsubscribeCallRef.current = unsubscribe;
   };
 
-  // --- WebRTC: Initialize Connection ---
   const initializePeerConnection = async (callId: string, role: 'caller' | 'callee') => {
     const pc = new RTCPeerConnection(rtcConfig);
     peerConnectionRef.current = pc;
 
-    // Add local tracks
     const stream = await getLocalStream();
-    stream.getTracks().forEach(track => {
-      pc.addTrack(track, stream);
-    });
+    stream.getTracks().forEach(track => pc.addTrack(track, stream));
 
-    // Handle remote tracks
     pc.ontrack = (event) => {
       if (remoteAudioRef.current) {
         remoteAudioRef.current.srcObject = event.streams[0];
@@ -434,22 +349,16 @@ export default function App() {
         setDebugMsg('');
       }
     };
-    
-    // WebRTC 连接状态监听，处理意外断开和失败
+
+    // WebRTC connection state check
     pc.oniceconnectionstatechange = () => {
-        if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
-            if (currentCallDocIdRef.current) { 
-                console.log(`WebRTC connection lost: ${pc.iceConnectionState}`);
-                setDebugMsg('连接已断开，请重试或换一个');
-                setTimeout(() => {
-                    hangUp(); 
-                }, 500);
-            }
+        if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+           console.log("ICE Connection failed/disconnected");
+           setDebugMsg('连接断开');
+           setTimeout(() => hangUp(), 1000);
         }
     };
-    // ----------------------------------------------------
 
-    // ICE Candidates Logic
     const callDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'voice_calls', callId);
     const candidatesCollection = collection(callDocRef, role === 'caller' ? 'calleeCandidates' : 'callerCandidates');
     const myCandidatesCollection = collection(callDocRef, role === 'caller' ? 'callerCandidates' : 'calleeCandidates');
@@ -460,15 +369,21 @@ export default function App() {
       }
     };
 
-    // Signaling Logic
+    // --- 关键修改区域：监听文档删除 (对方挂断) ---
     if (role === 'caller') {
-      // Create Offer
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       await updateDoc(callDocRef, { offer: { type: offer.type, sdp: offer.sdp } });
       
-      // Listen for Answer
       const unsub = onSnapshot(callDocRef, (snapshot) => {
+        // 1. 检查文档是否被删除（对方挂断或换人）
+        if (!snapshot.exists()) {
+            console.log("Call doc deleted (Caller view). Hanging up.");
+            hangUp();
+            return;
+        }
+
+        // 2. 处理 Answer
         const data = snapshot.data();
         if (!pc.currentRemoteDescription && data?.answer) {
           const answerDescription = new RTCSessionDescription(data.answer);
@@ -478,8 +393,16 @@ export default function App() {
       unsubscribeCallRef.current = unsub; 
 
     } else {
-      // Listen for Offer 
+      // Callee Logic
       const unsub = onSnapshot(callDocRef, async (snapshot) => {
+         // 1. 检查文档是否被删除（对方挂断或换人）
+         if (!snapshot.exists()) {
+            console.log("Call doc deleted (Callee view). Hanging up.");
+            hangUp();
+            return;
+         }
+
+         // 2. 处理 Offer
          const data = snapshot.data();
          if (!pc.currentRemoteDescription && data?.offer) {
             const offerDescription = new RTCSessionDescription(data.offer);
@@ -493,7 +416,7 @@ export default function App() {
       unsubscribeCallRef.current = unsub;
     }
 
-    // Listen for Remote ICE Candidates
+    // Listen for Candidates
     onSnapshot(candidatesCollection, (snapshot) => {
       snapshot.docChanges().forEach((change) => {
         if (change.type === 'added') {
@@ -505,11 +428,10 @@ export default function App() {
   };
 
   const handleNext = async () => {
-    // 确保 hangUp 完成清理，尤其是媒体流停止
     await hangUp();
     setTimeout(() => {
         startMatching();
-    }, 300); // Brief delay to reset UI visually
+    }, 300); 
   };
 
   const toggleMic = () => {
@@ -522,13 +444,10 @@ export default function App() {
     setMicEnabled(newMicState);
   };
 
-  // --- UI Render ---
   return (
     <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-between overflow-hidden font-sans">
-      {/* Hidden Audio Element */}
       <audio ref={remoteAudioRef} autoPlay playsInline />
 
-      {/* Header */}
       <header className="w-full p-4 flex justify-between items-center bg-gray-800/50 backdrop-blur-md border-b border-gray-700 absolute top-0 z-10">
         <div className="flex items-center gap-2">
           <Radio className={`w-5 h-5 ${status === 'connected' ? 'text-green-400 animate-pulse' : 'text-gray-400'}`} />
@@ -540,28 +459,20 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Content Area */}
       <main className="flex-1 w-full flex flex-col items-center justify-center relative px-4">
-        
-        {/* Status Indicator / Visualizer */}
         <div className="relative w-64 h-64 flex items-center justify-center mb-8">
-          
-          {/* Ripple Effects (CSS based) */}
           {status === 'searching' && (
             <>
                <div className="absolute w-full h-full rounded-full border-4 border-blue-500/30 animate-[ping_2s_ease-in-out_infinite]"></div>
                <div className="absolute w-48 h-48 rounded-full border-4 border-blue-500/50 animate-[ping_2s_ease-in-out_infinite_0.5s]"></div>
             </>
           )}
-          
           {status === 'connected' && (
             <>
               <div className="absolute w-64 h-64 bg-green-500/10 rounded-full blur-xl animate-pulse"></div>
               <div className="absolute w-56 h-56 rounded-full border border-green-500/20 animate-[spin_4s_linear_infinite]"></div>
             </>
           )}
-
-          {/* Central Avatar/Icon */}
           <div className={`relative z-10 w-32 h-32 rounded-full flex items-center justify-center shadow-2xl transition-all duration-500 ${
             status === 'connected' ? 'bg-gradient-to-br from-green-400 to-emerald-600 scale-110' :
             status === 'searching' ? 'bg-gradient-to-br from-blue-500 to-indigo-600' :
@@ -574,43 +485,23 @@ export default function App() {
           </div>
         </div>
 
-        {/* Text Status */}
         <div className="text-center space-y-2 z-10">
-          {status === 'idle' && (
-             <h2 className="text-2xl font-light text-gray-300">准备好了吗？</h2>
-          )}
-          
-          {status === 'searching' && (
-             <h2 className="text-2xl font-light text-blue-300 animate-pulse">正在寻找随机路人...</h2>
-          )}
-          
-          {status === 'connecting' && (
-             <h2 className="text-2xl font-light text-yellow-300">建立加密连接中...</h2>
-          )}
-          
+          {status === 'idle' && <h2 className="text-2xl font-light text-gray-300">准备好了吗？</h2>}
+          {status === 'searching' && <h2 className="text-2xl font-light text-blue-300 animate-pulse">正在寻找随机路人...</h2>}
+          {status === 'connecting' && <h2 className="text-2xl font-light text-yellow-300">建立加密连接中...</h2>}
           {status === 'connected' && (
             <>
               <h2 className="text-3xl font-bold text-white tracking-widest font-mono">{formatTime(callDuration)}</h2>
               <p className="text-green-400 text-sm">语音通道已建立</p>
             </>
           )}
-          
-          {status === 'error' && (
-            <p className="text-red-400">{debugMsg || "发生错误"}</p>
-          )}
-          
-          {/* Debug message for loading states */}
-          {status !== 'connected' && status !== 'idle' && debugMsg && (
-             <p className="text-gray-500 text-xs mt-2">{debugMsg}</p>
-          )}
+          {status === 'error' && <p className="text-red-400">{debugMsg || "发生错误"}</p>}
+          {status !== 'connected' && status !== 'idle' && debugMsg && <p className="text-gray-500 text-xs mt-2">{debugMsg}</p>}
         </div>
       </main>
 
-      {/* Controls Footer */}
       <footer className="w-full p-8 pb-12 bg-gray-800/30 backdrop-blur-sm rounded-t-3xl border-t border-white/5">
         <div className="flex items-center justify-center gap-6 max-w-md mx-auto">
-          
-          {/* Left: Mute Toggle (Only active when connected or searching) */}
           <button 
             onClick={toggleMic}
             disabled={status === 'idle'}
@@ -622,11 +513,10 @@ export default function App() {
             {micEnabled ? <Mic className="w-6 h-6" /> : <MicOff className="w-6 h-6" />}
           </button>
 
-          {/* Center: Main Action Button */}
           {status === 'idle' ? (
             <button 
               onClick={startMatching}
-              disabled={!user} // Disable if user is null (still authenticating)
+              disabled={!user} 
               className={`flex-1 font-bold py-4 px-8 rounded-full shadow-lg shadow-white/10 transition-all flex items-center justify-center gap-2 ${!user ? 'bg-gray-700 text-gray-400 cursor-not-allowed' : 'bg-white text-black hover:scale-105 active:scale-95'}`}
             >
               <Phone className="w-5 h-5" />
@@ -642,7 +532,6 @@ export default function App() {
             </button>
           )}
 
-          {/* Right: Hangup (Only visible when not idle) */}
           <button 
              onClick={hangUp}
              disabled={status === 'idle'}
@@ -652,7 +541,6 @@ export default function App() {
           >
             <PhoneOff className="w-6 h-6" />
           </button>
-
         </div>
         <p className="text-center text-gray-600 text-xs mt-6">
            匿名 • 随机 • 阅后即焚
